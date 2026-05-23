@@ -2,7 +2,7 @@ import pyshark
 from mac_vendor_lookup import MacLookup
 import os
 
-from constants import OS_TTL_VALUES
+from constants import OS_STATS, WINDOWS_ICMP_ID_VALUES
 
 
 class AnalyzeNetwork:
@@ -92,9 +92,12 @@ class AnalyzeNetwork:
             "MAC": mac,
             "IP": "Unknown",
             "VENDOR": "Unknown",
-            "Time-Zone": "Unknown",
+            "Time_Zone": "Unknown",
             "Received (Personally)": 0,
             "Sent": 0,
+            "ICMP_Data_Length": "Unknown",
+            "ICMP_IDs": [],
+            "ICMP_Sequence_Numbers": [],
         }
 
         if mac == "ff:ff:ff:ff:ff:ff" or mac == "00:00:00:00:00:00":
@@ -123,10 +126,14 @@ class AnalyzeNetwork:
                         info["IP"] = pkt.ip.src
 
                     # Check ICMP information
-                    if "icmp" in pkt and hasattr(pkt.icmp, "data_time"):
-                        info["Time-Zone"] = pkt.icmp.data_time[
-                            pkt.icmp.data_time.rfind("+") :
-                        ]
+                    if "icmp" in pkt:
+                        info["ICMP_Data_Length"] = len(pkt.icmp.Data.split(":"))
+                        info["ICMP_IDs"].append(int(pkt.icmp.ident))
+                        info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
+                        if hasattr(pkt.icmp, "data_time"):
+                            info["Time_Zone"] = pkt.icmp.data_time[
+                                pkt.icmp.data_time.rfind("+") :
+                            ]
                 elif pkt.eth.dst == mac:
                     is_received = True
 
@@ -155,40 +162,61 @@ class AnalyzeNetwork:
             "MAC": "Unknown",
             "IP": ip,
             "VENDOR": "Unknown",
-            "Time-Zone": "Unknown",
+            "Time_Zone": "Unknown",
             "Received (Personally)": 0,
             "Sent": 0,
+            "ICMP_Data_Length": "Unknown",
+            "ICMP_IDs": [],
+            "ICMP_Sequence_Numbers": [],
         }
 
-        # Check the IP
         for pkt in self.packets:
             is_received = False
             is_sent = False
 
+            # Check if pkt was sent / received by the ip
+            if "arp" in pkt:
+                if pkt.arp.src_proto_ipv4 == ip:
+                    is_sent = True
+                if pkt.arp.opcode == "2" and pkt.arp.dst_proto_ipv4 == ip:
+                    is_received = True
+            if "ip" in pkt:
+                if pkt.ip.src == ip:
+                    is_sent = True
+                if pkt.ip.dst == ip:
+                    is_received = True
+
+            # Check the MAC
             if "eth" in pkt:
                 # Check ARP information
                 if "arp" in pkt:
                     if pkt.arp.src_proto_ipv4 == ip:
                         info["MAC"] = pkt.eth.src
-                        is_sent = True
                     elif pkt.arp.opcode == "2" and pkt.arp.dst_proto_ipv4 == ip:
                         info["MAC"] = pkt.eth.dst
-                        is_received = True
 
                 # Check IP information
                 if "ip" in pkt:
                     if pkt.ip.src == ip:
                         info["MAC"] = pkt.eth.src
-                        is_sent = True
 
                         # Check ICMP information
                         if "icmp" in pkt and hasattr(pkt.icmp, "data_time"):
-                            info["Time-Zone"] = pkt.icmp.data_time[
+                            info["Time_Zone"] = pkt.icmp.data_time[
                                 pkt.icmp.data_time.rfind("+") :
                             ]
                     elif pkt.ip.dst == ip:
                         info["MAC"] = pkt.eth.dst
-                        is_received = True
+
+            # Check for ICMP attributes
+            if "icmp" in pkt and "ip" in pkt and pkt.ip.src == ip:
+                info["ICMP_Data_Length"] = len(pkt.icmp.Data.split(":"))
+                info["ICMP_IDs"].append(int(pkt.icmp.ident))
+                info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
+                if hasattr(pkt.icmp, "data_time"):
+                    info["Time_Zone"] = pkt.icmp.data_time[
+                        pkt.icmp.data_time.rfind("+") :
+                    ]
 
             if is_received:
                 info["Received (Personally)"] += 1
@@ -212,50 +240,43 @@ class AnalyzeNetwork:
         """
         Returns an array of all the possible operating systems of the device (strings)
         """
-        options = [[i, True] for i in OS_TTL_VALUES]
-        device_mac = device_info["MAC"]
+        # Source: https://www.cs.dartmouth.edu/~sergey/netreads/ICMP_Scanning_v3.0.pdf
 
-        if device_mac == "Unknown":
-            return [i[0] for i in options]
+        if device_info["MAC"] == "Unknown":
+            return "Unknown"
+        left_options = [i for i in OS_STATS]
 
-        # First, scan all of the TTL values set by the given device for every protocol
-        device_ttl_values = {"TCP": [], "UDP": [], "ICMP": []}
-        for pkt in self.packets:
-            if "eth" in pkt and pkt.eth.src == device_mac and "ip" in pkt:
-                pkt_ttl = int(pkt.ip.ttl)
-                if "tcp" in pkt:
-                    # TCP
-                    if pkt_ttl not in device_ttl_values["TCP"]:
-                        device_ttl_values["TCP"].append(pkt_ttl)
-                if "udp" in pkt:
-                    # UDP
-                    if pkt_ttl not in device_ttl_values["UDP"]:
-                        device_ttl_values["UDP"].append(pkt_ttl)
-                if "icmp" in pkt:
-                    # ICMP
-                    if pkt_ttl not in device_ttl_values["ICMP"]:
-                        device_ttl_values["ICMP"].append(pkt_ttl)
+        # Check the ICMP data field length
+        if device_info["ICMP_Data_Length"] != "Unknown":
+            left_options = [
+                i
+                for i in left_options
+                if i["ICMP_DATA_LENGTH"] == device_info["ICMP_Data_Length"]
+            ]
 
-        # Now, eliminate every OS not having a TTL we collected as a default value in the respectful protocol
-        # TCP
-        for i in device_ttl_values["TCP"]:
-            for j in options:
-                if i not in OS_TTL_VALUES[j[0]]["TCP"]:
-                    j[1] = False
+        if len(left_options) == 1:
+            return [i["OS"] for i in left_options]
 
-        # UDP
-        for i in device_ttl_values["UDP"]:
-            for j in options:
-                if i not in OS_TTL_VALUES[j[0]]["UDP"]:
-                    j[1] = False
+        # Check if the ICMP identifiers act like the Windows behavior
+        if len(device_info["ICMP_IDs"]) > 0:
+            is_all_ids_windows_defined_and_constant = True
+            for id in device_info["ICMP_IDs"]:
+                if id not in WINDOWS_ICMP_ID_VALUES or id != device_info["ICMP_IDs"][0]:
+                    is_all_ids_windows_defined_and_constant = False
+            if is_all_ids_windows_defined_and_constant:
+                return "Windows"
 
-        # ICMP
-        for i in device_ttl_values["ICMP"]:
-            for j in options:
-                if i not in OS_TTL_VALUES[j[0]]["ICMP"]:
-                    j[1] = False
+        # Check the ICMP sequence numbers
+        if len(device_info["ICMP_Sequence_Numbers"]) > 0:
+            for seq in device_info["ICMP_Sequence_Numbers"]:
+                left_options = [
+                    option
+                    for option in left_options
+                    if seq >= option["ICMP_SEQ_START"]
+                    and (seq - option["ICMP_SEQ_START"]) % option["ICMP_SEQ_GAP"] == 0
+                ]
 
-        return [i[0] for i in options if i[1]]
+        return [i["OS"] for i in left_options] if len(left_options) > 0 else ["Other"]
 
     def __repr__(self):
         return f"Network analyzer | {self.total_count} Packets | {self.tcp_count} TCP | {self.udp_count} UDP | {self.icmp_count} ICMP | {self.other_count} Other"
