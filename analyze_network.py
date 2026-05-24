@@ -362,7 +362,7 @@ class AnalyzeNetwork:
                     if port in info["Ports"]:
                         info["Ports"][port]["Count"] += 1
                     else:
-                        info["Ports"][port]["Count"] = {
+                        info["Ports"][port] = {
                             "Count": 1,
                             "Possible_Programs": "Unknown",
                         }
