@@ -1,6 +1,7 @@
 import pyshark
 from mac_vendor_lookup import MacLookup
 import os
+import re
 
 from constants import OS_STATS, WINDOWS_ICMP_ID_VALUES
 
@@ -83,6 +84,16 @@ class AnalyzeNetwork:
         except Exception:
             return "Unknown"
 
+    def programs_from_user_agent(self, user_agent):
+        """
+        Returns a list of programs (strings) appearing in the given user agent
+        """
+        return [
+            i.split("/")[0]
+            for i in re.findall(r'\[[^\]]*\]|\([^\)]*\)|"[^"]*"|\S+', user_agent)
+            if len(i) > 0 and i[0] != "("
+        ]
+
     def get_info_by_mac(self, mac):
         """
         Returns a dict with all information about the device with given MAC address
@@ -98,6 +109,7 @@ class AnalyzeNetwork:
             "ICMP_Data_Length": "Unknown",
             "ICMP_IDs": [],
             "ICMP_Sequence_Numbers": [],
+            "Ports": {},
         }
 
         if mac == "ff:ff:ff:ff:ff:ff" or mac == "00:00:00:00:00:00":
@@ -128,12 +140,59 @@ class AnalyzeNetwork:
                     # Check ICMP information
                     if "icmp" in pkt:
                         info["ICMP_Data_Length"] = len(pkt.icmp.Data.split(":"))
-                        info["ICMP_IDs"].append(int(pkt.icmp.ident))
-                        info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
+                        if int(pkt.icmp.ident) not in info["ICMP_IDs"]:
+                            info["ICMP_IDs"].append(int(pkt.icmp.ident))
+                        if int(pkt.icmp.seq) not in info["ICMP_Sequence_Numbers"]:
+                            info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
                         if hasattr(pkt.icmp, "data_time"):
                             info["Time_Zone"] = pkt.icmp.data_time[
                                 pkt.icmp.data_time.rfind("+") :
                             ]
+
+                    # Check for TCP and UDP attributes
+                    if "tcp" in pkt:
+                        port = str(pkt.tcp.srcport)
+                        if port in info["Ports"]:
+                            info["Ports"][port]["Count"] += 1
+                        else:
+                            info["Ports"][port] = {
+                                "Count": 1,
+                                "Possible_Programs": "Unknown",
+                            }
+
+                        # Check for HTTP information
+                        if (
+                            "http" in pkt
+                            and hasattr(pkt.http, "request_method")
+                            and pkt.http.request_method == "GET"
+                            and hasattr(pkt.http, "user_agent")
+                        ):
+                            possible_programs = self.programs_from_user_agent(
+                                pkt.http.user_agent
+                            )
+                            if info["Ports"][port]["Possible_Programs"] == "Unknown":
+                                info["Ports"][port]["Possible_Programs"] = (
+                                    possible_programs
+                                )
+                            else:
+                                info["Ports"][port]["Possible_Programs"] = [
+                                    i
+                                    for i in info["Ports"][port]["Possible_Programs"]
+                                    if i in possible_programs
+                                ]
+                        if "http" in pkt and hasattr(pkt.http, "server"):
+                            info["Ports"][port]["Possible_Programs"] = [
+                                (pkt.http.server.split("/")[0] + " web server")
+                            ]
+                    if "udp" in pkt:
+                        port = str(pkt.udp.srcport)
+                        if port in info["Ports"]:
+                            info["Ports"][port]["Count"] += 1
+                        else:
+                            info["Ports"][port] = {
+                                "Count": 1,
+                                "Possible_Programs": "Unknown",
+                            }
                 elif pkt.eth.dst == mac:
                     is_received = True
 
@@ -144,6 +203,26 @@ class AnalyzeNetwork:
                     # Check IP information
                     if "ip" in pkt:
                         info["IP"] = pkt.ip.dst
+
+                    # Check for TCP and UDP attributes
+                    if "tcp" in pkt:
+                        port = str(pkt.tcp.dstport)
+                        if port in info["Ports"]:
+                            info["Ports"][port]["Count"] += 1
+                        else:
+                            info["Ports"][port] = {
+                                "Count": 1,
+                                "Possible_Programs": "Unknown",
+                            }
+                    if "udp" in pkt:
+                        port = str(pkt.udp.dstport)
+                        if port in info["Ports"]:
+                            info["Ports"][port]["Count"] += 1
+                        else:
+                            info["Ports"][port] = {
+                                "Count": 1,
+                                "Possible_Programs": "Unknown",
+                            }
 
             if is_received:
                 info["Received (Personally)"] += 1
@@ -168,6 +247,7 @@ class AnalyzeNetwork:
             "ICMP_Data_Length": "Unknown",
             "ICMP_IDs": [],
             "ICMP_Sequence_Numbers": [],
+            "Ports": {},
         }
 
         for pkt in self.packets:
@@ -208,15 +288,84 @@ class AnalyzeNetwork:
                     elif pkt.ip.dst == ip:
                         info["MAC"] = pkt.eth.dst
 
-            # Check for ICMP attributes
-            if "icmp" in pkt and "ip" in pkt and pkt.ip.src == ip:
-                info["ICMP_Data_Length"] = len(pkt.icmp.Data.split(":"))
-                info["ICMP_IDs"].append(int(pkt.icmp.ident))
-                info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
-                if hasattr(pkt.icmp, "data_time"):
-                    info["Time_Zone"] = pkt.icmp.data_time[
-                        pkt.icmp.data_time.rfind("+") :
-                    ]
+            if "ip" in pkt and pkt.ip.src == ip:
+                # The packet was sent from the given ip
+                # Check for ICMP attributes
+                if "icmp" in pkt:
+                    info["ICMP_Data_Length"] = len(pkt.icmp.Data.split(":"))
+                    if int(pkt.icmp.ident) not in info["ICMP_IDs"]:
+                        info["ICMP_IDs"].append(int(pkt.icmp.ident))
+                    if int(pkt.icmp.seq) not in info["ICMP_Sequence_Numbers"]:
+                        info["ICMP_Sequence_Numbers"].append(int(pkt.icmp.seq))
+                    if hasattr(pkt.icmp, "data_time"):
+                        info["Time_Zone"] = pkt.icmp.data_time[
+                            pkt.icmp.data_time.rfind("+") :
+                        ]
+
+                # Check for TCP and UDP attributes
+                if "tcp" in pkt:
+                    port = str(pkt.tcp.srcport)
+                    if port in info["Ports"]:
+                        info["Ports"][port]["Count"] += 1
+                    else:
+                        info["Ports"][port] = {
+                            "Count": 1,
+                            "Possible_Programs": "Unknown",
+                        }
+
+                    # Check for HTTP information
+                    if (
+                        "http" in pkt
+                        and hasattr(pkt.http, "request_method")
+                        and pkt.http.request_method == "GET"
+                        and hasattr(pkt.http, "user_agent")
+                    ):
+                        possible_programs = self.programs_from_user_agent(
+                            pkt.http.user_agent
+                        )
+                        if info["Ports"][port]["Possible_Programs"] == "Unknown":
+                            info["Ports"][port]["Possible_Programs"] = possible_programs
+                        else:
+                            info["Ports"][port]["Possible_Programs"] = [
+                                i
+                                for i in info["Ports"][port]["Possible_Programs"]
+                                if i in possible_programs
+                            ]
+                    if "http" in pkt and hasattr(pkt.http, "server"):
+                        info["Ports"][port]["Possible_Programs"] = [
+                            (pkt.http.server.split("/")[0] + " web server")
+                        ]
+                if "udp" in pkt:
+                    port = str(pkt.udp.srcport)
+                    if port in info["Ports"]:
+                        info["Ports"][port]["Count"] += 1
+                    else:
+                        info["Ports"][port] = {
+                            "Count": 1,
+                            "Possible_Programs": "Unknown",
+                        }
+
+            if "ip" in pkt and pkt.ip.dst == ip:
+                # The packet was sent to the given ip
+                # Check for TCP and UDP attributes
+                if "tcp" in pkt:
+                    port = str(pkt.tcp.dstport)
+                    if port in info["Ports"]:
+                        info["Ports"][port]["Count"] += 1
+                    else:
+                        info["Ports"][port] = {
+                            "Count": 1,
+                            "Possible_Programs": "Unknown",
+                        }
+                if "udp" in pkt:
+                    port = str(pkt.udp.dstport)
+                    if port in info["Ports"]:
+                        info["Ports"][port]["Count"] += 1
+                    else:
+                        info["Ports"][port]["Count"] = {
+                            "Count": 1,
+                            "Possible_Programs": "Unknown",
+                        }
 
             if is_received:
                 info["Received (Personally)"] += 1
